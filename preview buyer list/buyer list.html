@@ -4,21 +4,22 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Iron Ape Inventory Catalog</title>
+  <meta name="description" content="Buyer-facing inventory preview for lots and wholesale." />
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    .fade-in { animation: fadeIn 0.4s ease-in-out; }
-    @keyframes fadeIn { from {opacity: 0; transform: translateY(10px);} to {opacity: 1; transform: translateY(0);} }
+    .fade-in { animation: fadeIn .25s ease-in-out; }
+    @keyframes fadeIn { from {opacity:0;transform:translateY(8px)} to {opacity:1;transform:translateY(0)} }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-900">
-
   <!-- HEADER -->
   <header class="bg-white shadow-sm sticky top-0 z-10">
     <div class="max-w-6xl mx-auto px-6 py-4 flex flex-col sm:flex-row justify-between items-center gap-3">
       <h1 class="text-2xl font-bold text-gray-800">Iron Ape Inventory</h1>
       <div class="flex items-center gap-2 w-full sm:w-auto">
-        <input id="search" type="text" placeholder="Search by make, model, or keyword"
-          class="flex-grow sm:flex-none px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm">
+        <input id="search" type="text" inputmode="search" autocomplete="off"
+               placeholder="Search by make, model, or keyword"
+               class="flex-grow sm:flex-none px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm">
         <select id="filter" class="px-3 py-2 border border-gray-300 rounded-xl text-sm">
           <option value="">All Categories</option>
           <option value="Jet Ski">Jet Skis</option>
@@ -30,75 +31,155 @@
 
   <!-- MAIN -->
   <main class="max-w-6xl mx-auto p-6">
+    <div id="notice" class="hidden mb-4 text-sm rounded-lg p-3 bg-yellow-50 text-yellow-800 border border-yellow-200"></div>
     <div id="inventory" class="grid gap-6 sm:grid-cols-2 lg:grid-cols-3"></div>
     <p id="empty" class="hidden text-center text-gray-400 mt-10">No results found.</p>
   </main>
 
   <!-- FOOTER -->
   <footer class="text-center text-gray-400 text-sm py-6">
-    Powered by <a href="https://prairiewebworks.com" class="text-blue-500 font-semibold hover:underline">Prairie Webworks</a>
+    Powered by <a href="https://prairiewebworks.com" target="_blank" rel="noopener" class="text-blue-500 font-semibold hover:underline">Prairie Webworks</a>
   </footer>
 
   <!-- SCRIPT -->
   <script>
+  // ==== Config ====
+  const DEFAULT_CSV = "inventory.csv"; // Put your file next to index.html
+  // Allow ?csv=<url> to override the data source (e.g., a published Google Sheet CSV)
+  const urlCsv = new URLSearchParams(location.search).get("csv");
+  const csvUrl = (urlCsv && decodeURIComponent(urlCsv)) || DEFAULT_CSV;
+
+  // Simple debounce for search
+  function debounce(fn, ms=200){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+
+  // Basic escape for text injection safety
+  const esc = (s)=> String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+  // CSV parser (handles quotes, commas, CRLF)
+  function parseCSV(text) {
+    const rows = [];
+    let cur = '', inQuotes = false, row = [];
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i], n = text[i+1];
+      if (c === '"') {
+        if (inQuotes && n === '"') { cur += '"'; i++; }
+        else { inQuotes = !inQuotes; }
+      } else if (c === ',' && !inQuotes) {
+        row.push(cur); cur = '';
+      } else if ((c === '\n' || c === '\r') && !inQuotes) {
+        if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+        cur = ''; row = [];
+        if (c === '\r' && n === '\n') i++; // swallow \r\n
+      } else {
+        cur += c;
+      }
+    }
+    if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+    return rows;
+  }
+
+  const normalizeHeader = (h)=>
+    h.trim().replace(/^\uFEFF/, '').toLowerCase().replace(/\s+/g,' ')
+     .replace(/[^a-z0-9 ]/g,'').replace(/ +/g,'_');
+
+  function mapRow(headers, row) {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = (row[i] || '').trim());
+
+    // Map to friendly keys with fallbacks (supports flexible CSV headers)
+    return {
+      raw: obj,
+      id: obj.id || obj.itemid || '',
+      category: obj.category || '',
+      make: obj.make || '',
+      model: obj.model || '',
+      year: obj.year || obj.yearrange || '',
+      condition: obj.condition || obj.completeness || '',
+      price: obj.price || obj.askingprice || obj.ask || '',
+      notes: obj.notes || obj.note || '',
+      photo: obj.photo || obj.photourl || obj.photo_url || obj.image || obj.imageurl || obj.image_url || ''
+    };
+  }
+
   async function loadInventory() {
-    const csvUrl = "inventory.csv"; // Replace with Google Sheets CSV link if desired
-    const res = await fetch(csvUrl);
-    const text = await res.text();
-    const rows = text.trim().split("\n").slice(1);
-    const data = rows.map(r => {
-      const cols = r.split(",");
-      return {
-        id: cols[0],
-        category: cols[1],
-        make: cols[2],
-        model: cols[3],
-        year: cols[4],
-        condition: cols[5],
-        price: cols[6],
-        notes: cols[7],
-        photo: cols[8],
-      };
-    });
-    renderInventory(data);
+    const notice = document.getElementById("notice");
+    notice.classList.add("hidden");
+    try {
+      // Cache-bust so updates show immediately
+      const sep = csvUrl.includes('?') ? '&' : '?';
+      const res = await fetch(`${csvUrl}${sep}t=${Date.now()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`CSV fetch failed: ${res.status}`);
+      const text = await res.text();
+      const table = parseCSV(text);
+      if (!table.length) {
+        showNotice("Your CSV is empty or malformed. Make sure the first row contains headers.");
+        return renderInventory([]);
+      }
+
+      const headers = table[0].map(normalizeHeader);
+      const rows = table.slice(1)
+        .filter(r => r && r.join('').trim().length)
+        .map(r => mapRow(headers, r));
+
+      window.__INVENTORY__ = rows; // for debugging
+      renderInventory(rows);
+    } catch (err) {
+      showNotice("Couldn’t load the CSV. Confirm the file name/path or try a full URL in the <code>?csv=</code> parameter.");
+      console.error(err);
+      renderInventory([]);
+    }
+  }
+
+  function showNotice(html) {
+    const n = document.getElementById("notice");
+    n.innerHTML = html;
+    n.classList.remove("hidden");
   }
 
   function renderInventory(data) {
     const container = document.getElementById("inventory");
+    const empty = document.getElementById("empty");
     container.innerHTML = "";
-    const search = document.getElementById("search").value.toLowerCase();
-    const filter = document.getElementById("filter").value;
 
-    const filtered = data.filter(item => {
-      const matchSearch = [item.make, item.model, item.notes].some(f => f && f.toLowerCase().includes(search));
-      const matchFilter = !filter || item.category === filter;
-      return matchSearch && matchFilter;
+    const q = (document.getElementById("search").value || "").toLowerCase();
+    const cat = document.getElementById("filter").value;
+
+    const filtered = (data || []).filter(it => {
+      const hay = [it.make, it.model, it.notes, it.category].join(' ').toLowerCase();
+      const matchQ = !q || hay.includes(q);
+      const matchCat = !cat || it.category === cat;
+      return matchQ && matchCat;
     });
 
-    if (filtered.length === 0) {
-      document.getElementById("empty").classList.remove("hidden");
+    if (!filtered.length) {
+      empty.classList.remove("hidden");
       return;
     } else {
-      document.getElementById("empty").classList.add("hidden");
+      empty.classList.add("hidden");
     }
 
     filtered.forEach(item => {
-      const card = document.createElement("div");
-      card.className = "fade-in bg-white rounded-2xl shadow hover:shadow-lg transition p-4 flex flex-col";
-      card.innerHTML = `
-        <img src="${item.photo || 'https://placehold.co/600x400?text=No+Image'}"
-          alt="${item.make} ${item.model}" class="rounded-xl h-48 w-full object-cover mb-3">
-        <h2 class="text-xl font-semibold">${item.make} ${item.model || ""}</h2>
-        <p class="text-sm text-gray-500">${item.year || ""} • ${item.condition || ""}</p>
-        <p class="text-lg font-bold mt-2 text-gray-800">$${item.price || "—"}</p>
-        <p class="text-sm mt-1 text-gray-600 flex-grow">${item.notes || ""}</p>
+      const wrap = document.createElement("div");
+      wrap.className = "fade-in bg-white rounded-2xl shadow hover:shadow-lg transition p-4 flex flex-col";
+      const title = [item.make, item.model].filter(Boolean).join(' ');
+      const meta = [item.year, item.condition].filter(Boolean).join(' • ');
+      wrap.innerHTML = `
+        <img src="${esc(item.photo || 'https://placehold.co/800x500?text=No+Image')}"
+             alt="${esc(title)}" loading="lazy"
+             class="rounded-xl h-48 w-full object-cover mb-3">
+        <h2 class="text-xl font-semibold">${esc(title)}</h2>
+        <p class="text-sm text-gray-500">${esc(meta)}</p>
+        <p class="text-lg font-bold mt-2 text-gray-800">${item.price ? ('$' + esc(item.price)) : '—'}</p>
+        <p class="text-sm mt-1 text-gray-600 flex-grow">${esc(item.notes)}</p>
       `;
-      container.appendChild(card);
+      container.appendChild(wrap);
     });
   }
 
-  document.getElementById("search").addEventListener("input", () => loadInventory());
-  document.getElementById("filter").addEventListener("change", () => loadInventory());
+  const rerender = debounce(() => renderInventory(window.__INVENTORY__ || []), 150);
+  document.getElementById("search").addEventListener("input", rerender);
+  document.getElementById("filter").addEventListener("change", rerender);
+
   loadInventory();
   </script>
 </body>
